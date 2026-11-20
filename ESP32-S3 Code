@@ -1,0 +1,1982 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <cstring>
+#include <math.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <RevEng_PAJ7620.h>
+
+#include <NimBleKeyboard.h>
+#include <NimBLEDevice.h>
+
+#include "ESP_I2S.h"
+#include "ESP_SR.h"
+#include "esp32-hal-psram.h"
+
+// =====================================================
+// GESTURE MUSIC - ESP32-S3
+// GESTURE + VOICE + SOUND + BATTERY
+// =====================================================
+
+// PAJ7620
+// SDA -> GPIO 8
+// SCL -> GPIO 9
+
+// ST7789
+// SCK -> GPIO 12
+// MOSI -> GPIO 11
+// CS -> GPIO 10
+// DC -> GPIO 13
+// RST -> GPIO 14
+
+// SPH0645 MICROPHONE
+// BCLK -> GPIO 5
+// LRCL -> GPIO 6
+// DOUT -> GPIO 7
+// SEL -> GND
+
+// BATTERY
+// Battery + -> 100k -> GPIO 4 -> 100k -> GND
+// Capacitor: GPIO 4 to GND
+
+// =====================================================
+// PINS
+// =====================================================
+
+#define PAJ_SDA 8
+#define PAJ_SCL 9
+
+#define TFT_CS 10
+#define TFT_MOSI 11
+#define TFT_SCK 12
+#define TFT_DC 13
+#define TFT_RST 14
+
+#define MIC_BCLK 5
+#define MIC_WS 6
+#define MIC_DOUT 7
+
+#define BATTERY_ADC_PIN 4
+
+// =====================================================
+// BATTERY SETTINGS
+// =====================================================
+
+const float BATTERY_R1 = 100000.0f;
+const float BATTERY_R2 = 100000.0f;
+
+const unsigned long BATTERY_UPDATE_MS = 3000;
+
+// NEW: Battery smoothing
+const int BATTERY_SAMPLES = 64;
+const float BATTERY_ALPHA = 0.15f;
+
+float batteryVoltage = 0;
+int batteryPercentage = -1;
+
+float smoothedBatteryVoltage = 0;
+bool batteryFilterInitialized = false;
+
+unsigned long lastBatteryUpdate = 0;
+
+// =====================================================
+// 2 SECOND COMMAND COOLDOWN
+// =====================================================
+
+const unsigned long COMMAND_COOLDOWN_MS = 2000;
+
+unsigned long lastCommandTime = 0;
+bool commandPreviouslyExecuted = false;
+
+bool commandCooldownActive() {
+
+ if (!commandPreviouslyExecuted) {
+ return false;
+ }
+
+ return millis() - lastCommandTime <
+ COMMAND_COOLDOWN_MS;
+}
+
+void startCommandCooldown() {
+
+ lastCommandTime = millis();
+ commandPreviouslyExecuted = true;
+}
+
+// =====================================================
+// BLE UUIDs
+// =====================================================
+
+#define SERVICE_UUID \
+"12345678-1234-1234-1234-1234567890AB"
+
+#define META_UUID \
+"12345678-1234-1234-1234-1234567890AC"
+
+#define ART_UUID \
+"12345678-1234-1234-1234-1234567890AD"
+
+// =====================================================
+// HARDWARE
+// =====================================================
+
+RevEng_PAJ7620 gestureSensor;
+
+Adafruit_ST7789 tft(
+ TFT_CS,
+ TFT_DC,
+ TFT_RST
+);
+
+I2SClass i2s;
+
+// =====================================================
+// ARTWORK
+// =====================================================
+
+#define ART_W 150
+#define ART_H 150
+#define ART_BYTES (ART_W * ART_H * 2)
+
+uint16_t* artwork = nullptr;
+
+volatile size_t artBytesReceived = 0;
+volatile bool receivingArt = false;
+volatile bool artworkReady = false;
+volatile bool screenUpdate = false;
+
+// =====================================================
+// SONG INFORMATION
+// =====================================================
+
+String currentTrack = "Bluetooth Audio";
+String currentArtist = "Waiting for music";
+
+// =====================================================
+// GESTURE SETTINGS
+// =====================================================
+
+bool gestureReady = false;
+
+unsigned long lastGesture = 0;
+const unsigned long GESTURE_COOLDOWN_MS = 350;
+
+// =====================================================
+// VOICE SETTINGS
+// =====================================================
+
+bool voiceReady = false;
+
+volatile bool wakeDetected = false;
+volatile bool timeoutDetected = false;
+volatile int detectedVoiceCommand = -1;
+
+// =====================================================
+// SOUND MODE
+// =====================================================
+
+bool soundMode = false;
+
+int sharpSoundCount = 0;
+
+unsigned long lastSharpSound = 0;
+unsigned long firstSharpSound = 0;
+
+const unsigned long SHARP_SOUND_DEBOUNCE_MS = 180;
+const unsigned long SHARP_SOUND_GROUP_MS = 650;
+
+const int SHARP_SOUND_THRESHOLD = 6000;
+
+// =====================================================
+// MEDIA ACTIONS
+// =====================================================
+
+enum MediaAction {
+
+ ACTION_NONE,
+ ACTION_PLAY_PAUSE,
+ ACTION_NEXT,
+ ACTION_PREVIOUS,
+ ACTION_VOLUME_UP,
+ ACTION_VOLUME_DOWN,
+ ACTION_MUTE
+};
+
+// Using int avoids Arduino auto-prototype problems.
+
+void performAction(int action, const char* source);
+
+// =====================================================
+// VOICE COMMAND IDs
+// =====================================================
+
+enum {
+
+ CMD_PLAY = 1,
+ CMD_PAUSE = 2,
+ CMD_NEXT = 3,
+ CMD_PREVIOUS = 4,
+ CMD_VOLUME_UP = 5,
+ CMD_VOLUME_DOWN = 6,
+ CMD_MUTE = 7
+};
+
+// =====================================================
+// VOICE COMMANDS
+// =====================================================
+
+static const sr_cmd_t srCommands[] = {
+
+ {CMD_PLAY, "play music"},
+ {CMD_PAUSE, "pause music"},
+ {CMD_NEXT, "next song"},
+ {CMD_PREVIOUS, "go back"},
+ {CMD_VOLUME_UP, "volume up"},
+ {CMD_VOLUME_DOWN, "volume down"},
+ {CMD_MUTE, "mute"}
+};
+
+#define SR_SAMPLE_RATE 16000
+#define SR_INPUT_FORMAT "M"
+#define SR_INPUT_CHANNELS SR_CHANNELS_MONO
+#define I2S_CHANNELS I2S_SLOT_MODE_MONO
+
+// =====================================================
+// BLUETOOTH METADATA CALLBACK
+// =====================================================
+
+class MetadataCallbacks :
+ public NimBLECharacteristicCallbacks {
+
+ void onWrite(
+ NimBLECharacteristic* characteristic,
+ NimBLEConnInfo& connInfo
+ ) override {
+
+ std::string raw = characteristic->getValue();
+
+ String message = "";
+
+ message.reserve(raw.size());
+
+ for (char c : raw) {
+ message += c;
+ }
+
+ // ARTWORK START
+
+ if (message.startsWith("ARTSTART:")) {
+
+ artBytesReceived = 0;
+ receivingArt = true;
+ artworkReady = false;
+
+ int expected = message.substring(9).toInt();
+
+ Serial.print("Artwork transfer starting: ");
+ Serial.println(expected);
+
+ return;
+ }
+
+ // ARTWORK END
+
+ if (message == "ARTEND") {
+
+ receivingArt = false;
+
+ Serial.print("Artwork bytes received: ");
+ Serial.println(artBytesReceived);
+
+ if (artBytesReceived == ART_BYTES) {
+
+ artworkReady = true;
+ screenUpdate = true;
+
+ Serial.println("ALBUM ART READY!");
+
+ } else {
+
+ Serial.println("Artwork size incorrect.");
+ }
+
+ return;
+ }
+
+ // TRACK AND ARTIST
+
+ int artistPosition = message.indexOf("\nARTIST:");
+
+ if (
+ message.startsWith("TRACK:") &&
+ artistPosition >= 0
+ ) {
+
+ currentTrack =
+ message.substring(6, artistPosition);
+
+ currentArtist =
+ message.substring(artistPosition + 8);
+
+ currentTrack.trim();
+ currentArtist.trim();
+
+ if (currentTrack.length() == 0) {
+ currentTrack = "Unknown Track";
+ }
+
+ if (currentArtist.length() == 0) {
+ currentArtist = "Unknown Artist";
+ }
+
+ Serial.println();
+ Serial.println("NEW SONG");
+
+ Serial.print("Track: ");
+ Serial.println(currentTrack);
+
+ Serial.print("Artist: ");
+ Serial.println(currentArtist);
+
+ screenUpdate = true;
+ }
+ }
+};
+
+// =====================================================
+// ARTWORK CALLBACK
+// =====================================================
+
+class ArtworkCallbacks :
+ public NimBLECharacteristicCallbacks {
+
+ void onWrite(
+ NimBLECharacteristic* characteristic,
+ NimBLEConnInfo& connInfo
+ ) override {
+
+ if (!receivingArt || artwork == nullptr) {
+ return;
+ }
+
+ std::string data = characteristic->getValue();
+
+ size_t remaining =
+ ART_BYTES - artBytesReceived;
+
+ size_t amount = data.size();
+
+ if (amount > remaining) {
+ amount = remaining;
+ }
+
+ memcpy(
+ ((uint8_t*)artwork) + artBytesReceived,
+ data.data(),
+ amount
+ );
+
+ artBytesReceived += amount;
+ }
+};
+
+MetadataCallbacks metadataCallbacks;
+ArtworkCallbacks artworkCallbacks;
+
+// =====================================================
+// CUSTOM BLE KEYBOARD
+// =====================================================
+
+class GestureMusicKeyboard : public BleKeyboard {
+
+public:
+
+ GestureMusicKeyboard(
+ std::string name,
+ std::string manufacturer,
+ uint8_t battery
+ )
+ :
+ BleKeyboard(name, manufacturer, battery) {}
+
+protected:
+
+ void onStarted(NimBLEServer* server) override {
+
+ NimBLEService* service =
+ server->createService(SERVICE_UUID);
+
+ NimBLECharacteristic* metadata =
+ service->createCharacteristic(
+ META_UUID,
+ NIMBLE_PROPERTY::WRITE |
+ NIMBLE_PROPERTY::WRITE_NR
+ );
+
+ metadata->setCallbacks(&metadataCallbacks);
+
+ NimBLECharacteristic* art =
+ service->createCharacteristic(
+ ART_UUID,
+ NIMBLE_PROPERTY::WRITE |
+ NIMBLE_PROPERTY::WRITE_NR
+ );
+
+ art->setCallbacks(&artworkCallbacks);
+
+ service->start();
+
+ Serial.println(
+ "GestureMusic metadata service ready."
+ );
+ }
+
+ void onConnect(
+ NimBLEServer* server,
+ NimBLEConnInfo& connInfo
+ ) override {
+
+ BleKeyboard::onConnect(server, connInfo);
+
+ Serial.println("Bluetooth connected.");
+
+ NimBLEDevice::getAdvertising()->start();
+ }
+
+ void onDisconnect(
+ NimBLEServer* server,
+ NimBLEConnInfo& connInfo,
+ int reason
+ ) override {
+
+ BleKeyboard::onDisconnect(
+ server,
+ connInfo,
+ reason
+ );
+
+ Serial.println("Bluetooth disconnected.");
+
+ NimBLEDevice::getAdvertising()->start();
+ }
+};
+
+// =====================================================
+// BLE KEYBOARD
+// =====================================================
+
+GestureMusicKeyboard bleKeyboard(
+ "GestureMusic",
+ "ESP32-S3",
+ 100
+);
+
+uint8_t customAddress[6] = {
+
+ 0xC2,
+ 0x11,
+ 0x22,
+ 0x33,
+ 0x44,
+ 0x66
+};
+
+// =====================================================
+// TEXT HELPERS
+// =====================================================
+
+String shorten(String text, int length) {
+
+ if (text.length() <= length) {
+ return text;
+ }
+
+ return text.substring(0, length - 3) + "...";
+}
+
+void centeredText(
+ String text,
+ int y,
+ uint8_t size,
+ uint16_t color
+) {
+
+ int16_t x1;
+ int16_t y1;
+ uint16_t w;
+ uint16_t h;
+
+ tft.setTextSize(size);
+ tft.setTextColor(color);
+
+ tft.getTextBounds(
+ text, 0, y,
+ &x1, &y1, &w, &h
+ );
+
+ int x = (tft.width() - w) / 2;
+
+ if (x < 0) x = 0;
+
+ tft.setCursor(x, y);
+ tft.print(text);
+}
+
+// =====================================================
+// BATTERY PERCENTAGE ESTIMATION
+// =====================================================
+
+int voltageToPercentage(float voltage) {
+
+ const float voltages[] = {
+ 3.30, 3.50, 3.60, 3.70, 3.75,
+ 3.80, 3.85, 3.90, 4.00, 4.10, 4.20
+ };
+
+ const int percentages[] = {
+ 0, 5, 10, 20, 30,
+ 40, 50, 60, 75, 90, 100
+ };
+
+ if (voltage <= voltages[0]) return 0;
+ if (voltage >= voltages[10]) return 100;
+
+ for (int i = 1; i < 11; i++) {
+
+ if (voltage <= voltages[i]) {
+
+ float fraction =
+ (voltage - voltages[i - 1]) /
+ (voltages[i] - voltages[i - 1]);
+
+ return percentages[i - 1] +
+ roundf(
+ fraction *
+ (percentages[i] - percentages[i - 1])
+ );
+ }
+ }
+
+ return 100;
+}
+
+// =====================================================
+// BATTERY INDICATOR
+// =====================================================
+
+void drawBatteryIndicator() {
+
+ tft.fillRect(
+ 173, 0, 41, 29,
+ ST77XX_BLACK
+ );
+
+ tft.setTextSize(1);
+
+ if (
+ batteryPercentage >= 0 &&
+ batteryPercentage <= 20
+ ) {
+
+ tft.setTextColor(ST77XX_RED);
+
+ } else {
+
+ tft.setTextColor(ST77XX_WHITE);
+ }
+
+ tft.setCursor(177, 11);
+
+ if (batteryPercentage < 0) {
+
+ tft.print("--%");
+
+ } else {
+
+ tft.print(batteryPercentage);
+ tft.print("%");
+ }
+}
+
+// =====================================================
+// HEADER
+// =====================================================
+
+void drawHeader() {
+
+ tft.fillRect(
+ 0, 0, 240, 30,
+ ST77XX_BLACK
+ );
+
+ tft.setTextSize(1);
+ tft.setTextColor(ST77XX_WHITE);
+
+ tft.setCursor(12, 11);
+ tft.print("GESTURE MUSIC");
+
+ drawBatteryIndicator();
+
+ if (bleKeyboard.isConnected()) {
+
+ tft.fillCircle(
+ 220, 14, 4,
+ ST77XX_GREEN
+ );
+
+ } else {
+
+ tft.fillCircle(
+ 220, 14, 4,
+ ST77XX_RED
+ );
+ }
+}
+
+// =====================================================
+// NEW: SMOOTHED BATTERY READING
+// =====================================================
+
+void updateBatteryReading(bool force = false) {
+
+ unsigned long now = millis();
+
+ // Update every 3 seconds
+
+ if (
+ !force &&
+ now - lastBatteryUpdate < BATTERY_UPDATE_MS
+ ) {
+ return;
+ }
+
+ lastBatteryUpdate = now;
+
+ // ==========================================
+ // STEP 1: Read 64 ADC samples
+ // ==========================================
+
+ // Discard the first reading.
+
+ analogReadMilliVolts(BATTERY_ADC_PIN);
+
+ uint32_t totalMilliVolts = 0;
+
+ for (int i = 0; i < BATTERY_SAMPLES; i++) {
+
+ totalMilliVolts +=
+ analogReadMilliVolts(BATTERY_ADC_PIN);
+
+ delayMicroseconds(200);
+ }
+
+ float gpioVoltage =
+ (totalMilliVolts / (float)BATTERY_SAMPLES)
+ / 1000.0f;
+
+ // ==========================================
+ // STEP 2: Calculate battery voltage
+ // ==========================================
+
+ float rawBatteryVoltage =
+ gpioVoltage *
+ ((BATTERY_R1 + BATTERY_R2) / BATTERY_R2);
+
+ // ==========================================
+ // STEP 3: Exponential smoothing
+ // ==========================================
+
+ if (!batteryFilterInitialized) {
+
+ smoothedBatteryVoltage =
+ rawBatteryVoltage;
+
+ batteryFilterInitialized = true;
+
+ } else {
+
+ smoothedBatteryVoltage =
+ BATTERY_ALPHA * rawBatteryVoltage +
+ (1.0f - BATTERY_ALPHA) *
+ smoothedBatteryVoltage;
+ }
+
+ batteryVoltage = smoothedBatteryVoltage;
+
+ // ==========================================
+ // STEP 4: Convert voltage to percentage
+ // ==========================================
+
+ int targetPercentage = -1;
+
+ if (batteryVoltage >= 2.5f) {
+
+ targetPercentage =
+ voltageToPercentage(batteryVoltage);
+ }
+
+ // ==========================================
+ // STEP 5: Limit percentage change
+ // ==========================================
+
+ if (targetPercentage < 0) {
+
+ batteryPercentage = -1;
+
+ } else if (batteryPercentage < 0) {
+
+ // Initial reading
+
+ batteryPercentage = targetPercentage;
+
+ } else if (targetPercentage > batteryPercentage) {
+
+ // Increase by maximum 1%
+
+ batteryPercentage++;
+
+ } else if (targetPercentage < batteryPercentage) {
+
+ // Decrease by maximum 1%
+
+ batteryPercentage--;
+ }
+
+ // ==========================================
+ // STEP 6: Debug output
+ // ==========================================
+
+ Serial.print("Battery raw: ");
+ Serial.print(rawBatteryVoltage, 3);
+
+ Serial.print(" V | Smoothed: ");
+ Serial.print(batteryVoltage, 3);
+
+ Serial.print(" V | Percentage: ");
+ Serial.print(batteryPercentage);
+ Serial.println("%");
+
+ // ==========================================
+ // STEP 7: Update TFT
+ // ==========================================
+
+ drawBatteryIndicator();
+}
+
+// =====================================================
+// ARTWORK CARD
+// =====================================================
+
+void drawArtworkCard() {
+
+ uint16_t cardColor =
+ tft.color565(25, 25, 30);
+
+ tft.fillRoundRect(
+ 35, 32, 170, 170, 12,
+ cardColor
+ );
+}
+
+// =====================================================
+// FALLBACK ARTWORK
+// =====================================================
+
+void drawFallbackArtwork() {
+
+ uint16_t background =
+ tft.color565(35, 35, 42);
+
+ tft.fillRect(
+ 45, 42, ART_W, ART_H,
+ background
+ );
+
+ uint16_t accent =
+ tft.color565(80, 180, 255);
+
+ tft.fillRect(105, 76, 8, 60, accent);
+ tft.fillRect(105, 76, 39, 8, accent);
+ tft.fillRect(136, 76, 8, 47, accent);
+
+ tft.fillCircle(94, 139, 14, accent);
+ tft.fillCircle(133, 126, 14, accent);
+}
+
+// =====================================================
+// ALBUM ART
+// =====================================================
+
+void drawAlbumArtwork() {
+
+ if (
+ artworkReady &&
+ artwork != nullptr
+ ) {
+
+ tft.drawRGBBitmap(
+ 45, 42,
+ artwork,
+ ART_W,
+ ART_H
+ );
+
+ } else {
+
+ drawFallbackArtwork();
+ }
+}
+
+// =====================================================
+// TRACK INFO
+// =====================================================
+
+void drawTrackInfo() {
+
+ tft.fillRect(
+ 5, 205, 230, 58,
+ ST77XX_BLACK
+ );
+
+ String title = currentTrack;
+
+ String line1 = "";
+ String line2 = "";
+
+ if (title.length() <= 19) {
+
+ line1 = title;
+
+ } else {
+
+ int split = title.lastIndexOf(' ', 19);
+
+ if (split < 5) {
+ split = 19;
+ }
+
+ line1 = title.substring(0, split);
+
+ line2 = title.substring(split);
+
+ line2.trim();
+
+ line2 = shorten(line2, 19);
+ }
+
+ centeredText(
+ line1, 210, 1,
+ ST77XX_WHITE
+ );
+
+ if (line2.length()) {
+
+ centeredText(
+ line2, 224, 1,
+ ST77XX_WHITE
+ );
+ }
+
+ String artist =
+ shorten(currentArtist, 30);
+
+ centeredText(
+ artist, 245, 1,
+ tft.color565(150, 150, 160)
+ );
+}
+
+// =====================================================
+// MEDIA ICONS
+// =====================================================
+
+void drawControls() {
+
+ tft.fillRect(
+ 0, 266, 240, 34,
+ ST77XX_BLACK
+ );
+
+ uint16_t c =
+ tft.color565(220, 220, 225);
+
+ // Previous
+
+ tft.fillRect(53, 278, 3, 12, c);
+
+ tft.fillTriangle(
+ 56, 284,
+ 68, 276,
+ 68, 292,
+ c
+ );
+
+ // Play/Pause
+
+ tft.drawCircle(120, 284, 14, c);
+
+ tft.fillRect(115, 277, 3, 14, c);
+ tft.fillRect(122, 277, 3, 14, c);
+
+ // Next
+
+ tft.fillTriangle(
+ 172, 276,
+ 172, 292,
+ 184, 284,
+ c
+ );
+
+ tft.fillRect(184, 278, 3, 12, c);
+}
+
+// =====================================================
+// STATUS
+// =====================================================
+
+void drawStatus(String overrideText = "") {
+
+ tft.fillRect(
+ 0, 302, 240, 18,
+ ST77XX_BLACK
+ );
+
+ String status;
+ uint16_t pillColor;
+
+ if (overrideText.length() > 0) {
+
+ status = overrideText;
+
+ pillColor =
+ tft.color565(40, 70, 100);
+
+ } else if (soundMode) {
+
+ status = "SOUND MODE";
+
+ pillColor =
+ tft.color565(100, 70, 20);
+
+ } else if (bleKeyboard.isConnected()) {
+
+ if (voiceReady) {
+
+ status = "BT + VOICE READY";
+
+ } else {
+
+ status = "BT CONNECTED";
+ }
+
+ pillColor =
+ tft.color565(30, 90, 55);
+
+ } else {
+
+ status =
+ voiceReady ? "VOICE READY" : "BT WAITING";
+
+ pillColor =
+ tft.color565(80, 45, 45);
+ }
+
+ tft.fillRoundRect(
+ 50, 305, 140, 12, 6,
+ pillColor
+ );
+
+ centeredText(
+ status, 307, 1,
+ ST77XX_WHITE
+ );
+}
+
+// =====================================================
+// MAIN SCREEN
+// =====================================================
+
+void drawMainScreen() {
+
+ tft.fillScreen(ST77XX_BLACK);
+
+ tft.setTextWrap(false);
+
+ drawHeader();
+ drawArtworkCard();
+ drawAlbumArtwork();
+ drawTrackInfo();
+ drawControls();
+ drawStatus();
+}
+
+// =====================================================
+// PERFORM MEDIA ACTION
+// =====================================================
+
+void performAction(
+ int action,
+ const char* source
+) {
+
+ if (action == ACTION_NONE) {
+ return;
+ }
+
+ // Ignore commands during cooldown.
+
+ if (commandCooldownActive()) {
+ return;
+ }
+
+ if (!bleKeyboard.isConnected()) {
+
+ Serial.println(
+ "Bluetooth not connected. Command ignored."
+ );
+
+ return;
+ }
+
+ Serial.print(source);
+ Serial.print(": ");
+
+ switch (action) {
+
+ case ACTION_PLAY_PAUSE:
+
+ Serial.println("PLAY / PAUSE");
+
+ bleKeyboard.write(
+ KEY_MEDIA_PLAY_PAUSE
+ );
+
+ break;
+
+ case ACTION_NEXT:
+
+ Serial.println("NEXT");
+
+ bleKeyboard.write(
+ KEY_MEDIA_NEXT_TRACK
+ );
+
+ break;
+
+ case ACTION_PREVIOUS:
+
+ Serial.println("PREVIOUS");
+
+ bleKeyboard.write(
+ KEY_MEDIA_PREVIOUS_TRACK
+ );
+
+ break;
+
+ case ACTION_VOLUME_UP:
+
+ Serial.println("VOLUME UP");
+
+ bleKeyboard.write(
+ KEY_MEDIA_VOLUME_UP
+ );
+
+ delay(60);
+
+ bleKeyboard.write(
+ KEY_MEDIA_VOLUME_UP
+ );
+
+ break;
+
+ case ACTION_VOLUME_DOWN:
+
+ Serial.println("VOLUME DOWN");
+
+ bleKeyboard.write(
+ KEY_MEDIA_VOLUME_DOWN
+ );
+
+ delay(60);
+
+ bleKeyboard.write(
+ KEY_MEDIA_VOLUME_DOWN
+ );
+
+ break;
+
+ case ACTION_MUTE:
+
+ Serial.println("MUTE");
+
+ bleKeyboard.write(
+ KEY_MEDIA_MUTE
+ );
+
+ break;
+
+ default:
+
+ return;
+ }
+
+ startCommandCooldown();
+
+ Serial.println("Command cooldown: 2 seconds");
+}
+
+// =====================================================
+// ENABLE SOUND MODE
+// =====================================================
+
+void enableSoundMode() {
+
+ if (soundMode) return;
+
+ Serial.println();
+ Serial.println("Entering SOUND MODE...");
+
+ if (voiceReady) {
+
+ ESP_SR.pause();
+
+ delay(40);
+ }
+
+ sharpSoundCount = 0;
+ lastSharpSound = 0;
+ firstSharpSound = 0;
+
+ soundMode = true;
+
+ drawStatus("SOUND MODE");
+
+ Serial.println("1 sound = PLAY/PAUSE");
+ Serial.println("2 sounds = NEXT");
+ Serial.println("3 sounds = PREVIOUS");
+}
+
+// =====================================================
+// DISABLE SOUND MODE
+// =====================================================
+
+void disableSoundMode() {
+
+ if (!soundMode) return;
+
+ soundMode = false;
+
+ sharpSoundCount = 0;
+ lastSharpSound = 0;
+ firstSharpSound = 0;
+
+ if (voiceReady) {
+
+ ESP_SR.resume();
+
+ delay(40);
+ }
+
+ Serial.println();
+ Serial.println("SOUND MODE OFF");
+
+ Serial.println("Voice recognition resumed.");
+
+ drawStatus();
+}
+
+// =====================================================
+// TOGGLE SOUND MODE
+// =====================================================
+
+void toggleSoundMode() {
+
+ if (commandCooldownActive()) {
+ return;
+ }
+
+ detectedVoiceCommand = -1;
+ wakeDetected = false;
+ timeoutDetected = false;
+
+ if (soundMode) {
+
+ disableSoundMode();
+
+ } else {
+
+ enableSoundMode();
+ }
+
+ startCommandCooldown();
+}
+
+// =====================================================
+// EXECUTE SOUND PATTERN
+// =====================================================
+
+void executeSharpSoundPattern() {
+
+ if (sharpSoundCount <= 0) return;
+
+ int count = sharpSoundCount;
+
+ sharpSoundCount = 0;
+ firstSharpSound = 0;
+ lastSharpSound = 0;
+
+ if (commandCooldownActive()) {
+ return;
+ }
+
+ Serial.print("Sharp sound pattern: ");
+ Serial.println(count);
+
+ if (count == 1) {
+
+ performAction(
+ ACTION_PLAY_PAUSE,
+ "SOUND"
+ );
+
+ drawStatus("1 SOUND: PLAY");
+
+ } else if (count == 2) {
+
+ performAction(
+ ACTION_NEXT,
+ "SOUND"
+ );
+
+ drawStatus("2 SOUNDS: NEXT");
+
+ } else {
+
+ performAction(
+ ACTION_PREVIOUS,
+ "SOUND"
+ );
+
+ drawStatus("3 SOUNDS: PREV");
+ }
+
+ delay(250);
+
+ drawStatus("SOUND MODE");
+}
+
+// =====================================================
+// SHARP SOUND DETECTION
+// =====================================================
+
+void checkSharpSounds() {
+
+ if (!soundMode) return;
+
+ int16_t samples[128];
+
+ size_t bytesRead =
+ i2s.readBytes(
+ (char*)samples,
+ sizeof(samples)
+ );
+
+ int count =
+ bytesRead / sizeof(int16_t);
+
+ if (count <= 0) return;
+
+ // Discard sound activity during cooldown.
+
+ if (commandCooldownActive()) {
+
+ sharpSoundCount = 0;
+ lastSharpSound = 0;
+ firstSharpSound = 0;
+
+ return;
+ }
+
+ long peak = 0;
+
+ for (int i = 0; i < count; i++) {
+
+ long magnitude =
+ abs((long)samples[i]);
+
+ if (magnitude > peak) {
+ peak = magnitude;
+ }
+ }
+
+ unsigned long now = millis();
+
+ if (peak >= SHARP_SOUND_THRESHOLD) {
+
+ if (
+ lastSharpSound == 0 ||
+ now - lastSharpSound >=
+ SHARP_SOUND_DEBOUNCE_MS
+ ) {
+
+ sharpSoundCount++;
+
+ if (sharpSoundCount == 1) {
+ firstSharpSound = now;
+ }
+
+ lastSharpSound = now;
+
+ Serial.print("SHARP SOUND! Peak = ");
+ Serial.print(peak);
+
+ Serial.print(" | Count = ");
+ Serial.println(sharpSoundCount);
+
+ if (sharpSoundCount == 1) {
+
+ drawStatus("SOUND 1");
+
+ } else if (sharpSoundCount == 2) {
+
+ drawStatus("SOUND 2");
+
+ } else {
+
+ drawStatus("SOUND 3");
+ }
+ }
+ }
+
+ if (
+ sharpSoundCount > 0 &&
+ lastSharpSound > 0 &&
+ now - lastSharpSound >=
+ SHARP_SOUND_GROUP_MS
+ ) {
+
+ executeSharpSoundPattern();
+ }
+}
+
+// =====================================================
+// GESTURE RECOGNITION
+// =====================================================
+
+// RIGHT -> Next
+// LEFT -> Previous
+// FORWARD -> Play/Pause
+// UP -> Volume Up
+// DOWN -> Volume Down
+// WAVE -> Mute
+// BACKWARD -> Toggle Sound Mode
+
+void checkGestures() {
+
+ if (!gestureReady) return;
+
+ Gesture gesture =
+ gestureSensor.readGesture();
+
+ if (gesture == GES_NONE) return;
+
+ // Discard gestures during cooldown.
+
+ if (commandCooldownActive()) {
+ return;
+ }
+
+ if (
+ millis() - lastGesture <
+ GESTURE_COOLDOWN_MS
+ ) {
+ return;
+ }
+
+ if (gesture == GES_BACKWARD) {
+
+ lastGesture = millis();
+
+ toggleSoundMode();
+
+ return;
+ }
+
+ int action = ACTION_NONE;
+
+ switch (gesture) {
+
+ case GES_RIGHT:
+
+ action = ACTION_NEXT;
+ break;
+
+ case GES_LEFT:
+
+ action = ACTION_PREVIOUS;
+ break;
+
+ case GES_FORWARD:
+
+ action = ACTION_PLAY_PAUSE;
+ break;
+
+ case GES_UP:
+
+ action = ACTION_VOLUME_UP;
+ break;
+
+ case GES_DOWN:
+
+ action = ACTION_VOLUME_DOWN;
+ break;
+
+ case GES_WAVE:
+
+ action = ACTION_MUTE;
+ break;
+
+ default:
+
+ break;
+ }
+
+ if (action != ACTION_NONE) {
+
+ lastGesture = millis();
+
+ performAction(
+ action,
+ "GESTURE"
+ );
+ }
+}
+
+// =====================================================
+// ESP-SR CALLBACK
+// =====================================================
+
+void onSrEvent(
+ sr_event_t event,
+ int command_id,
+ int phrase_id
+) {
+
+ switch (event) {
+
+ case SR_EVENT_WAKEWORD:
+
+ if (
+ !soundMode &&
+ !commandCooldownActive()
+ ) {
+
+ wakeDetected = true;
+
+ ESP_SR.setMode(SR_MODE_COMMAND);
+ }
+
+ break;
+
+ case SR_EVENT_WAKEWORD_CHANNEL:
+
+ if (
+ !soundMode &&
+ !commandCooldownActive()
+ ) {
+
+ wakeDetected = true;
+
+ ESP_SR.setMode(SR_MODE_COMMAND);
+ }
+
+ break;
+
+ case SR_EVENT_COMMAND:
+
+ if (
+ !soundMode &&
+ !commandCooldownActive()
+ ) {
+
+ detectedVoiceCommand = command_id;
+ }
+
+ ESP_SR.setMode(SR_MODE_COMMAND);
+
+ break;
+
+ case SR_EVENT_TIMEOUT:
+
+ timeoutDetected = true;
+
+ ESP_SR.setMode(SR_MODE_WAKEWORD);
+
+ break;
+
+ default:
+ break;
+ }
+}
+
+// =====================================================
+// VOICE COMMAND HANDLER
+// =====================================================
+
+void handleVoiceCommand(int command) {
+
+ if (commandCooldownActive()) return;
+
+ switch (command) {
+
+ case CMD_PLAY:
+
+ performAction(
+ ACTION_PLAY_PAUSE,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_PAUSE:
+
+ performAction(
+ ACTION_PLAY_PAUSE,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_NEXT:
+
+ performAction(
+ ACTION_NEXT,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_PREVIOUS:
+
+ performAction(
+ ACTION_PREVIOUS,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_VOLUME_UP:
+
+ performAction(
+ ACTION_VOLUME_UP,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_VOLUME_DOWN:
+
+ performAction(
+ ACTION_VOLUME_DOWN,
+ "VOICE"
+ );
+
+ break;
+
+ case CMD_MUTE:
+
+ performAction(
+ ACTION_MUTE,
+ "VOICE"
+ );
+
+ break;
+
+ default:
+
+ Serial.print("Unknown voice command: ");
+ Serial.println(command);
+
+ break;
+ }
+}
+
+// =====================================================
+// VOICE SETUP
+// =====================================================
+
+void setupVoice() {
+
+ Serial.println();
+ Serial.println("Starting microphone...");
+
+ i2s.setTimeout(1000);
+
+ i2s.setPins(
+ MIC_BCLK,
+ MIC_WS,
+ -1,
+ MIC_DOUT
+ );
+
+ if (
+ !i2s.begin(
+ I2S_MODE_STD,
+ SR_SAMPLE_RATE,
+ I2S_DATA_BIT_WIDTH_32BIT,
+ I2S_CHANNELS,
+ I2S_STD_SLOT_LEFT
+ )
+ ) {
+
+ Serial.println(
+ "ERROR: I2S microphone failed."
+ );
+
+ return;
+ }
+
+ if (
+ !i2s.configureRX(
+ SR_SAMPLE_RATE,
+ I2S_DATA_BIT_WIDTH_32BIT,
+ I2S_CHANNELS,
+ I2S_RX_TRANSFORM_32_TO_16
+ )
+ ) {
+
+ Serial.println(
+ "ERROR: I2S conversion failed."
+ );
+
+ i2s.end();
+
+ return;
+ }
+
+ Serial.println("Microphone ready.");
+
+ ESP_SR.onEvent(onSrEvent);
+
+ Serial.println("Starting ESP-SR...");
+
+ bool srStarted =
+ ESP_SR.begin(
+ i2s,
+ srCommands,
+ sizeof(srCommands) / sizeof(sr_cmd_t),
+ SR_INPUT_CHANNELS,
+ SR_MODE_WAKEWORD,
+ SR_INPUT_FORMAT
+ );
+
+ if (!srStarted) {
+
+ Serial.println("ERROR: ESP-SR failed.");
+
+ return;
+ }
+
+ voiceReady = true;
+
+ Serial.println();
+ Serial.println("ESP-SR VOICE READY");
+
+ Serial.println("Say: Hi ESP");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+ Serial.begin(115200);
+
+ delay(2000);
+
+ Serial.println();
+ Serial.println("================================");
+ Serial.println("GESTURE MUSIC");
+ Serial.println("ESP32-S3 FULL SYSTEM");
+ Serial.println("================================");
+
+ // =================================================
+ // PSRAM / ARTWORK BUFFER
+ // =================================================
+
+ Serial.print("PSRAM bytes: ");
+ Serial.println(ESP.getPsramSize());
+
+ artwork =
+ (uint16_t*)ps_malloc(ART_BYTES);
+
+ if (artwork != nullptr) {
+
+ memset(artwork, 0, ART_BYTES);
+
+ Serial.println(
+ "Artwork buffer allocated in PSRAM."
+ );
+
+ } else {
+
+ artwork =
+ (uint16_t*)malloc(ART_BYTES);
+
+ if (artwork != nullptr) {
+ memset(artwork, 0, ART_BYTES);
+ }
+ }
+
+ // =================================================
+ // BATTERY ADC
+ // =================================================
+
+ analogReadResolution(12);
+
+ analogSetPinAttenuation(
+ BATTERY_ADC_PIN,
+ ADC_11db
+ );
+
+ Serial.println(
+ "Battery monitoring enabled on GPIO 4."
+ );
+
+ Serial.println(
+ "Battery smoothing: 64 samples, alpha 0.15"
+ );
+
+ // =================================================
+ // TFT DISPLAY
+ // =================================================
+
+ SPI.begin(
+ TFT_SCK,
+ -1,
+ TFT_MOSI,
+ TFT_CS
+ );
+
+ tft.init(240, 320);
+
+ tft.setRotation(2);
+
+ drawMainScreen();
+
+ updateBatteryReading(true);
+
+ Serial.println("Display ready.");
+
+ // =================================================
+ // GESTURE SENSOR
+ // =================================================
+
+ Wire.setPins(
+ PAJ_SDA,
+ PAJ_SCL
+ );
+
+ delay(100);
+
+ if (gestureSensor.begin()) {
+
+ gestureReady = true;
+
+ gestureSensor.setGestureExitTime(250);
+
+ Serial.println("PAJ7620 ready.");
+
+ } else {
+
+ Serial.println(
+ "PAJ7620 initialization failed."
+ );
+ }
+
+ // =================================================
+ // VOICE
+ // =================================================
+
+ setupVoice();
+
+ // =================================================
+ // BLUETOOTH
+ // =================================================
+
+ Serial.println("Starting Bluetooth...");
+
+ NimBLEDevice::init("GestureMusic");
+
+ NimBLEDevice::setOwnAddr(customAddress);
+
+ NimBLEDevice::setOwnAddrType(0x01);
+
+ bleKeyboard.begin();
+
+ Serial.println(
+ "Bluetooth ready: GestureMusic"
+ );
+
+ Serial.println();
+ Serial.println("SYSTEM READY");
+
+ Serial.println(
+ "BACKWARD gesture toggles SOUND MODE."
+ );
+
+ Serial.println(
+ "Command cooldown: 2000 ms."
+ );
+
+ drawHeader();
+ drawStatus();
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+ static bool oldBluetoothState = false;
+
+ // =================================================
+ // BATTERY MONITORING
+ // =================================================
+
+ updateBatteryReading();
+
+ // =================================================
+ // COMMAND COOLDOWN
+ // =================================================
+
+ if (commandCooldownActive()) {
+
+ detectedVoiceCommand = -1;
+ wakeDetected = false;
+ }
+
+ // =================================================
+ // BLUETOOTH CONNECTION STATUS
+ // =================================================
+
+ bool connected =
+ bleKeyboard.isConnected();
+
+ if (connected != oldBluetoothState) {
+
+ oldBluetoothState = connected;
+
+ drawHeader();
+ drawStatus();
+
+ if (connected) {
+
+ Serial.println(
+ "GestureMusic connected."
+ );
+
+ } else {
+
+ Serial.println(
+ "GestureMusic disconnected."
+ );
+ }
+ }
+
+ // =================================================
+ // DISPLAY UPDATE
+ // =================================================
+
+ if (screenUpdate) {
+
+ screenUpdate = false;
+
+ drawArtworkCard();
+ drawAlbumArtwork();
+ drawTrackInfo();
+ }
+
+ // =================================================
+ // GESTURES
+ // =================================================
+
+ checkGestures();
+
+ // =================================================
+ // SOUND MODE
+ // =================================================
+
+ if (soundMode) {
+
+ checkSharpSounds();
+ }
+
+ // =================================================
+ // VOICE WAKEWORD
+ // =====================================================
+
+ if (
+ !soundMode &&
+ !commandCooldownActive() &&
+ wakeDetected
+ ) {
+
+ wakeDetected = false;
+
+ Serial.println();
+ Serial.println(">>> HI ESP DETECTED <<<");
+ Serial.println("Listening...");
+
+ drawStatus("LISTENING...");
+ }
+
+ // =================================================
+ // VOICE COMMAND
+ // =====================================================
+
+ if (
+ !soundMode &&
+ !commandCooldownActive() &&
+ detectedVoiceCommand >= 0
+ ) {
+
+ int command =
+ detectedVoiceCommand;
+
+ detectedVoiceCommand = -1;
+
+ handleVoiceCommand(command);
+
+ drawStatus("VOICE COMMAND");
+
+ delay(250);
+
+ drawStatus();
+ }
+
+ // =================================================
+ // VOICE TIMEOUT
+ // =====================================================
+
+ if (
+ !soundMode &&
+ timeoutDetected
+ ) {
+
+ timeoutDetected = false;
+
+ Serial.println(
+ "Voice command timeout."
+ );
+
+ drawStatus();
+ }
+
+ delay(5);
+}
